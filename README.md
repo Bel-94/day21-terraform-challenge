@@ -5,7 +5,7 @@
 ```
 day_21/
 ├── .github/workflows/
-│   └── terraform-workflow.yml   # CI: lint → unit tests → integration tests
+│   └── terraform-workflow.yml   # CI: lint - unit tests
 ├── sentinel/
 │   ├── require-instance-type.sentinel
 │   └── sentinel.hcl
@@ -17,6 +17,7 @@ day_21/
 │   ├── webserver_test.tftest.hcl
 │   └── scripts/
 │       └── user-data.sh
+├── images/
 ├── PR_DESCRIPTION.md
 └── README.md
 ```
@@ -27,126 +28,191 @@ day_21/
 
 ### Step 1 — Version Control
 
-Verify branch protection on `main`:
-- Require at least 1 reviewer approval before merge
-- Require status checks (lint + unit-tests) to pass before merge
-- Block direct pushes to main
+A dedicated GitHub repository was created for Day 21. Branch protection was configured on `main` using GitHub's Rulesets:
+
+- Require a pull request before merging
+- Block force pushes to main
+- No direct pushes allowed
+
+All infrastructure changes travel through a feature branch - PR - CI - merge workflow. No commits land directly on `main`.
 
 ```bash
-# Confirm you are on a feature branch, never on main
+# Always confirm you are on a feature branch, never on main
 git branch
 # Expected: * add-cloudwatch-alarms-day21
 ```
-
-GitHub branch protection settings path:
-`Settings → Branches → Branch protection rules → main`
 
 ---
 
 ### Step 2 — Run the Code Locally (terraform plan)
 
+Before making any change, `terraform plan` was run against the existing state to establish a clean baseline.
+
 ```bash
-cd day_21/webserver-cluster
+cd webserver-cluster
 
 # Authenticate with Terraform Cloud
 terraform login
 
-# Initialise (downloads providers, connects to TFC backend)
+# Initialise — downloads providers, connects to TFC backend
 terraform init
 
 # Generate and save the plan — ALWAYS save to a file
-terraform plan -out=day21.tfplan
-
-# Review the plan output carefully:
-# - Count resources: to add / to change / to destroy
-# - ANY destruction line requires extra scrutiny before proceeding
+terraform plan -out day21.tfplan
 ```
 
-Expected plan output for this change:
+![terraform init and plan](images/terraform-init-hecp-terraform.png)
+
+![terraform plan output](images/terraform-plan.png)
+
+The plan showed exactly what was expected:
 ```
 Plan: 1 to add, 0 to change, 0 to destroy.
 Changes to Outputs:
   + asg_name = (known after apply)
 ```
 
+> The plan file is saved to `day21.tfplan`. This binary file is never committed to Git, it is applied exactly as reviewed in Step 7.
+
 ---
 
 ### Step 3 — Make Code Changes on a Feature Branch
+
+The infrastructure change for Day 21:
+- **New resource:** `aws_cloudwatch_metric_alarm.low_cpu` — fires when average CPU stays below 20% for 6 minutes (scale-in signal)
+- **New variable:** `cpu_low_threshold` (default: 20)
+- **New outputs:** `asg_name`, `cloudwatch_alarms`
 
 ```bash
 # Create the feature branch
 git checkout -b add-cloudwatch-alarms-day21
 
-# The changes are already in main.tf and outputs.tf:
-#   - aws_cloudwatch_metric_alarm.low_cpu  (new resource)
-#   - variable "cpu_low_threshold"         (new variable)
-#   - output "asg_name"                    (new output)
-#   - output "cloudwatch_alarms"           (new output)
-
-# Re-run plan on the feature branch to confirm only expected changes
-terraform plan -out=day21.tfplan
-
-# Stage and commit
+# Stage and commit the changes
 git add .
 git commit -m "Add low-CPU alarm and asg_name output for webserver cluster"
 git push origin add-cloudwatch-alarms-day21
+```
+
+The key addition in `main.tf`:
+
+```hcl
+# NEW in Day 21 — low-CPU alarm (scale-in signal)
+resource "aws_cloudwatch_metric_alarm" "low_cpu" {
+  alarm_name          = "${var.cluster_name}-low-cpu"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"
+  threshold           = var.cpu_low_threshold
+  alarm_description   = "Fires when average CPU stays below ${var.cpu_low_threshold}% for 6 minutes"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.this.name
+  }
+}
 ```
 
 ---
 
 ### Step 4 — Submit for Review (Pull Request)
 
-Open a PR from `add-cloudwatch-alarms-day21` → `main`.
+A PR was opened from `add-cloudwatch-alarms-day21` - `main`. The PR description included the full plan output, blast radius assessment, and rollback plan so the reviewer could understand exactly what would change in AWS without running Terraform themselves.
 
-Paste the full content of `PR_DESCRIPTION.md` into the PR description.
-The reviewer must be able to understand exactly what will change in AWS
-from the PR alone — without running Terraform themselves.
+**PR template used:**
 
-Key sections the reviewer checks:
-1. Plan output — confirms only 1 resource added, 0 destroyed
-2. Blast radius — confirms no shared infrastructure is touched
-3. Rollback plan — confirms there is a safe revert path
+```
+## What this changes
+Add a low-CPU CloudWatch alarm and asg_name output.
+
+## Terraform plan output
+Plan: 1 to add, 0 to change, 0 to destroy.
+
+## Resources affected
+- Created: 1 (aws_cloudwatch_metric_alarm.low_cpu)
+- Modified: 0
+- Destroyed: 0
+
+## Blast radius
+Additive only no shared infrastructure touched.
+
+## Rollback plan
+terraform destroy -target=aws_cloudwatch_metric_alarm.low_cpu
+```
 
 ---
 
 ### Step 5 — Run Automated Tests
 
-The GitHub Actions workflow (`.github/workflows/terraform-workflow.yml`) runs
-automatically when the PR is opened:
+The GitHub Actions workflow ran automatically on PR open with two jobs:
 
-**Job 1 — lint** (no AWS needed):
+**Job 1 — lint** (no AWS credentials needed):
 ```bash
 terraform fmt -check -recursive
 terraform init -backend=false
 terraform validate
 ```
 
-**Job 2 — unit-tests** (no AWS needed):
+**Job 2 — unit-tests** (no AWS credentials needed):
 ```bash
 terraform init -backend=false
 terraform test
-# Runs all 14 assertions in webserver_test.tftest.hcl
-# All use command = plan — zero real resources created
+# 15 assertions in webserver_test.tftest.hcl
+# All use mock_provider "aws" {} — zero real resources created
 ```
 
-Both jobs must be green before the PR is eligible for merge.
+![CI lint and unit tests passed](images/lint-unittests-passed.png)
 
-To run tests locally before pushing:
+Both jobs green; PR eligible for merge.
+
+**Challenges encountered and fixed:**
+- `terraform fmt -check` failed on `outputs.tf` due to misaligned map keys, fixed by running `terraform fmt` locally
+- `terraform test` failed with "No valid credential sources found"  fixed by adding `mock_provider "aws" {}` to the test file, which tells the test runner to use a fake provider instead of authenticating with real AWS
+
+To run tests locally:
 ```bash
-cd day_21/webserver-cluster
+cd webserver-cluster
+terraform fmt -check -recursive
 terraform init -backend=false
-terraform fmt -check
 terraform validate
 terraform test
+```
+
+![Local tests passing](images/local-tests-passed.png)
+
+Expected output:
+```
+run "validate_asg_name_prefix"... pass
+run "validate_instance_type"... pass
+run "validate_health_check_type"... pass
+run "validate_alb_sg_port"... pass
+run "validate_environment_tag"... pass
+run "validate_high_cpu_alarm_name"... pass
+run "validate_high_cpu_alarm_threshold"... pass
+run "validate_high_cpu_alarm_operator"... pass
+run "validate_low_cpu_alarm_name"... pass
+run "validate_low_cpu_alarm_threshold"... pass
+run "validate_low_cpu_alarm_operator"... pass
+run "validate_unhealthy_hosts_alarm"... pass
+run "validate_sns_topic_name"... pass
+run "reject_invalid_environment"... pass
+run "reject_invalid_instance_type"... pass
+15 tests, 0 failures
 ```
 
 ---
 
 ### Step 6 — Merge and Tag
 
-Once approved and CI is green, merge the PR.
+With CI green the PR was merged into `main`.
 
-Tag the new module version:
+![Ready to merge after tests passed](images/ready-to-merge-after-tests-passed.png)
+
+The new module version was tagged immediately after merge:
+
 ```bash
 git checkout main
 git pull origin main
@@ -154,39 +220,50 @@ git tag -a "v1.5.0" -m "Add low-CPU alarm and asg_name output for webserver clus
 git push origin v1.5.0
 ```
 
+![Tag on main branch](images/tag-main-branch.png)
+
 ---
 
 ### Step 7 — Deploy (Apply the Saved Plan)
 
-```bash
-cd day_21/webserver-cluster
+The saved plan file from Step 2 was applied  exactly what was reviewed, nothing more:
 
-# Apply EXACTLY what was reviewed — never run terraform apply without a plan file
+```bash
+cd webserver-cluster
 terraform apply day21.tfplan
 ```
 
-Post-apply verification:
-```bash
-# 1. Confirm the new alarm exists in CloudWatch
-aws cloudwatch describe-alarms \
-  --alarm-names "belinda-day21-low-cpu" \
-  --query 'MetricAlarms[0].{Name:AlarmName,State:StateValue,Threshold:Threshold}' \
-  --output table
+![terraform apply terminal output](images/terraform-apply-terminal.png)
 
-# 2. Confirm all three alarms are present
+![terraform apply in Terraform Cloud](images/terraform-apply-terraform-cloud.png)
+
+**Post-apply verification:**
+
+```bash
+# 1. Confirm all three alarms exist
 aws cloudwatch describe-alarms \
   --alarm-name-prefix "belinda-day21" \
   --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue}' \
   --output table
+```
 
-# 3. Run plan immediately after apply — must return clean (exit code 0)
+![All 3 alarms confirmed in CloudWatch](images/Confirm-all-3-alarms-exist.png)
+
+```bash
+# 2. Confirm plan is clean — no drift
 terraform plan -detailed-exitcode
-# Exit code 0 = no changes = state matches reality
+# Exit code 0 = state matches reality
+```
 
-# 4. Confirm the new output is present
+![Plan is clean after apply — no drift](images/plan-is-clean-no-drift.png)
+
+```bash
+# 3. Confirm outputs
 terraform output asg_name
 terraform output cloudwatch_alarms
 ```
+
+![Outputs confirmed](images/confirm-outputs.png)
 
 ---
 
@@ -194,36 +271,29 @@ terraform output cloudwatch_alarms
 
 ### 1. Approval Gates for Destructive Changes
 
-In Terraform Cloud:
-- Go to workspace → Settings → General
-- Enable "Require confirmation for apply" (manual apply mode)
-- For any plan showing destructions: require a second explicit approval
-  separate from the PR review
+In Terraform Cloud, manual apply mode was enabled:
+- Workspace - Settings - General - Apply Method - **Manual apply**
+- Any plan showing `destroy` lines requires explicit confirmation before apply proceeds
 
-If `terraform plan` shows any `destroy` lines, stop and get explicit
-sign-off from a second engineer before applying.
+If `terraform plan` shows any destruction, stop get sign-off from a second engineer before applying.
 
 ### 2. Plan File Pinning
 
-Always apply from a saved plan file:
-
 ```bash
 # CORRECT — apply exactly what was reviewed
-terraform plan -out=day21.tfplan
-# ... reviewer approves the plan output ...
+terraform plan -out day21.tfplan
 terraform apply day21.tfplan
 
-# RISKY — never do this; the plan may differ from what was reviewed
+# RISKY — never do this; generates a fresh plan at apply time
 # terraform apply
 ```
 
-The gap between `terraform plan` and `terraform apply` can be minutes or
-hours. If another engineer applies a change in that window, your apply
-will operate on different state than what was reviewed.
+The gap between `terraform plan` and `terraform apply` can be minutes or hours. If another engineer applies a change in that window, your apply operates on different state than what was reviewed. The reviewed plan is no longer accurate.
 
 ### 3. State Backup Before Apply
 
-Verify S3 state bucket versioning is enabled:
+State is stored in Terraform Cloud with full version history. Before any significant apply, verify versioning:
+
 ```bash
 aws s3api get-bucket-versioning \
   --bucket belinda-terraform-state-30daychallenge \
@@ -231,18 +301,14 @@ aws s3api get-bucket-versioning \
 # Expected: "Enabled"
 ```
 
-List available state versions (use before any significant apply):
+To restore a previous state version:
 ```bash
 aws s3api list-object-versions \
   --bucket belinda-terraform-state-30daychallenge \
   --prefix day21/webserver-cluster/terraform.tfstate \
   --query 'Versions[*].{VersionId:VersionId,LastModified:LastModified}' \
   --output table
-```
 
-Restore a previous state version if apply corrupts state:
-```bash
-# Get the VersionId from the list above, then:
 aws s3api get-object \
   --bucket belinda-terraform-state-30daychallenge \
   --key day21/webserver-cluster/terraform.tfstate \
@@ -252,14 +318,7 @@ aws s3api get-object \
 
 ### 4. Blast Radius Documentation
 
-Every PR touching shared infrastructure (VPCs, security groups, IAM roles)
-must document:
-- What other resources depend on the changed resource
-- What breaks if the apply fails midway through
-- The rollback path
-
-This PR's blast radius: **minimal** — the new alarm is additive only and
-scoped to this ASG. No shared infrastructure is modified.
+Every PR touching shared infrastructure must document what breaks if the apply fails midway. This PR's blast radius was **minimal** — the new alarm is additive only and scoped to this ASG. No VPCs, security groups, or IAM roles were modified.
 
 ---
 
@@ -269,21 +328,23 @@ File: `sentinel/require-instance-type.sentinel`
 
 ### What it enforces
 
-Every `aws_instance` and `aws_launch_template` resource in the plan must use
-an instance type from this approved list:
-`t2.micro`, `t2.small`, `t2.medium`, `t3.micro`, `t3.small`, `t3.medium`
+Every `aws_instance` and `aws_launch_template` in the plan must use an instance type from the approved list:
 
-### What it blocks
+```
+t2.micro  t2.small  t2.medium  t3.micro  t3.small  t3.medium
+```
+
+### What it blocks vs allows
 
 ```hcl
-# This plan would be BLOCKED by Sentinel:
+# BLOCKED — m5.large is not in the approved list
 resource "aws_launch_template" "this" {
-  instance_type = "m5.large"   # not in allowed list → BLOCKED
+  instance_type = "m5.large"
 }
 
-# This plan would be ALLOWED:
+# ALLOWED — t2.micro is in the approved list
 resource "aws_launch_template" "this" {
-  instance_type = "t2.micro"   # in allowed list → ALLOWED
+  instance_type = "t2.micro"
 }
 ```
 
@@ -292,21 +353,22 @@ resource "aws_launch_template" "this" {
 | | `terraform validate` | Sentinel |
 |---|---|---|
 | When it runs | Before plan, locally | After plan, in Terraform Cloud |
-| What it checks | Syntax, type correctness | Actual planned values |
+| What it checks | Syntax and type correctness | Actual planned values |
 | Can enforce business rules | No | Yes |
 | Can check instance_type values | No | Yes |
 | Scope | Single workspace | Entire organisation |
 
-`terraform validate` would pass `instance_type = "m5.large"` because it is
-syntactically valid. Sentinel blocks it because it violates the cost policy.
+`terraform validate` passes `instance_type = "m5.large"` because it is syntactically valid HCL. Sentinel blocks it because the actual value violates the cost policy. This is the critical difference — Sentinel operates on what Terraform *will do*, not just whether the code is valid.
 
 ### Connecting Sentinel to Terraform Cloud
 
-1. Push the `sentinel/` directory to a GitHub repo
-2. In Terraform Cloud: Settings → Policy Sets → Connect a new policy set
-3. Select the repo and set the path to `sentinel/`
+1. Push the `sentinel/` directory to GitHub
+2. Terraform Cloud - Settings - Policy Sets - Connect a new policy set
+3. Select the repo, set path to `sentinel/`
 4. Apply the policy set to your workspace
 5. Every plan now runs through Sentinel before apply is permitted
+
+> Note: Sentinel requires Terraform Cloud Plus or Business tier. On free/trial tiers, set `enforcement_level = "advisory"` in `sentinel.hcl` to log warnings without blocking applies.
 
 ---
 
@@ -314,136 +376,68 @@ syntactically valid. Sentinel blocks it because it violates the cost policy.
 
 ### 1. State files have no application equivalent
 
-Infrastructure deployments operate against a state file that records what
-currently exists in AWS. If two engineers run `terraform apply` simultaneously,
-they corrupt each other's state. Application deployments have no equivalent
-shared mutable file — a bad app deploy returns a 500 error; a bad infra deploy
-can delete a production database.
+Infrastructure deployments operate against a state file that records what currently exists in AWS. If two engineers run `terraform apply` simultaneously, they corrupt each other's state. A bad application deploy returns a 500 error. A bad infrastructure deploy can delete a production database.
 
-**Why it matters:** State locking (via Terraform Cloud or DynamoDB) and plan
-file pinning exist specifically because of this risk. Application CI/CD has
-no equivalent safeguard.
+**Why it matters:** State locking and plan file pinning exist specifically because of this risk. Application CI/CD has no equivalent safeguard.
 
 ### 2. Blast radius is asymmetric
 
-A bad application deploy affects the application. A bad infrastructure deploy
-can affect every application that depends on the changed resource. Modifying
-a shared security group or VPC can break dozens of services simultaneously.
+A bad application deploy affects that application only. A bad infrastructure deploy can affect every application that depends on the changed resource — modifying a shared security group or VPC can break dozens of services simultaneously.
 
-**Why it matters:** Infrastructure PRs require explicit blast radius
-documentation. Application PRs do not, because the failure domain is bounded
-by the application itself.
+**Why it matters:** Infrastructure PRs require explicit blast radius documentation. Application PRs do not, because the failure domain is bounded by the application itself.
 
 ### 3. Rollback is not always possible
 
-Application rollback is usually "redeploy the previous version." Infrastructure
-rollback can be impossible — you cannot un-delete a database, un-rotate a
-secret, or un-replace an EC2 instance that held in-memory state. Some
-infrastructure changes are one-way doors.
+Application rollback means redeploy the previous version. Infrastructure rollback can be impossible, you cannot un-delete a database, un-rotate a secret, or recover an EC2 instance that held in-memory state. Some infrastructure changes are one-way doors.
 
-**Why it matters:** Approval gates for destructive changes exist because
-`terraform destroy` on a production database cannot be undone by redeploying
-the previous Docker image.
+**Why it matters:** Approval gates for destructive changes exist because `terraform destroy` on a production database cannot be undone by redeploying the previous Docker image.
 
 ---
 
 ## Chapter 10 Learnings
 
-**Most dangerous step:** The author identifies the `terraform apply` step as
-the most dangerous — specifically the gap between `plan` and `apply`. If
-infrastructure changes between the two (another engineer applies, a resource
-is modified manually, drift occurs), the apply operates on different state
-than what was reviewed. The reviewed plan is no longer accurate.
+**Most dangerous step:** The author identifies `terraform apply` as the most dangerous step; specifically the gap between `plan` and `apply`. If infrastructure changes between the two (another engineer applies, a resource is modified manually, drift occurs), the apply operates on different state than what was reviewed. The reviewed plan is no longer accurate.
 
-**Safeguard most teams skip:** Saving the plan to a file and applying from
-that file (`terraform plan -out=reviewed.tfplan` + `terraform apply reviewed.tfplan`).
-Most teams run `terraform apply` directly, which generates a fresh plan at
-apply time. This means the apply can differ from what was reviewed — defeating
-the entire purpose of the review step.
+**Safeguard most teams skip:** Saving the plan to a file and applying from that exact file:
+```bash
+terraform plan -out=reviewed.tfplan
+terraform apply reviewed.tfplan
+```
+Most teams run `terraform apply` directly, which generates a fresh plan at apply time. This means the apply can differ from what was reviewed — defeating the entire purpose of the review step.
 
 ---
 
-## Tests to Run — Complete Reference
+## Cleanup
 
-### Local (no AWS credentials needed)
-
-```bash
-cd day_21/webserver-cluster
-
-# 1. Format check
-terraform fmt -check -recursive
-
-# 2. Syntax and type validation
-terraform init -backend=false
-terraform validate
-
-# 3. Unit tests — 14 assertions, all plan-only
-terraform test
-
-# Expected output:
-# run "validate_asg_name_prefix"... pass
-# run "validate_instance_type"... pass
-# run "validate_health_check_type"... pass
-# run "validate_alb_sg_port"... pass
-# run "validate_environment_tag"... pass
-# run "validate_high_cpu_alarm_name"... pass
-# run "validate_high_cpu_alarm_threshold"... pass
-# run "validate_high_cpu_alarm_operator"... pass
-# run "validate_low_cpu_alarm_name"... pass
-# run "validate_low_cpu_alarm_threshold"... pass
-# run "validate_low_cpu_alarm_operator"... pass
-# run "validate_unhealthy_hosts_alarm"... pass
-# run "validate_sns_topic_name"... pass
-# run "reject_invalid_environment"... pass
-# run "reject_invalid_instance_type"... pass
-# 15 tests, 0 failures
-```
-
-### With AWS credentials (post-apply verification)
+After verifying all outputs and confirming the plan was clean, the infrastructure was destroyed to avoid ongoing AWS costs:
 
 ```bash
-# Confirm new alarm exists
-aws cloudwatch describe-alarms \
-  --alarm-name-prefix "belinda-day21" \
-  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue,Threshold:Threshold}' \
-  --output table
-
-# Confirm state is clean after apply
-terraform plan -detailed-exitcode
-# Exit code 0 = clean, 1 = error, 2 = changes pending
-
-# Confirm ASG output
-terraform output asg_name
-
-# Confirm all alarm outputs
-terraform output cloudwatch_alarms
-
-# Confirm S3 state versioning
-aws s3api get-bucket-versioning \
-  --bucket belinda-terraform-state-30daychallenge \
-  --query 'Status'
+terraform destroy
 ```
+
+![Destroy running in Terraform Cloud](images/destroy-running-on-terraform-cloud.png)
+
+![Destroy successful](images/destroy-successful.png)
 
 ---
 
 ## Challenges and Fixes
 
-**Plan file handling:** The plan file (`day21.tfplan`) is a binary — do not
-commit it to Git. Add `*.tfplan` to `.gitignore`. The plan file is only valid
-for the state version it was generated against; regenerate it if state changes
-between plan and apply.
+**`terraform fmt -check` failed in CI:** `outputs.tf` had misaligned map keys. Fixed by running `terraform fmt -recursive` locally before pushing.
 
-**Sentinel configuration:** Sentinel requires a Terraform Cloud Plus or
-Business tier. On free/trial tiers, use `enforcement_level = "advisory"` to
-log warnings without blocking applies while testing the policy.
+**`terraform test` failed with AWS credential error:** The test runner tried to initialise the real AWS provider even with `-backend=false`. Fixed by adding `mock_provider "aws" {}` at the top of `webserver_test.tftest.hcl` — this replaces the real provider with a fake one so no credentials are needed.
 
-**Approval gates:** Terraform Cloud's manual apply mode (Settings → General →
-Apply Method → Manual apply) is the simplest approval gate. For destructive
-changes, add a required reviewer to the workspace and document the second
-approval in the PR comments.
+**Sentinel on free tier:** Sentinel policy enforcement requires Terraform Cloud Plus. On the free tier, `enforcement_level = "advisory"` is used so the policy runs and logs results without blocking applies.
 
-**`terraform init -backend=false`:** Required for local unit tests when the
-backend is Terraform Cloud, because the test runner cannot authenticate to TFC
-in CI without credentials. The `-backend=false` flag skips backend
-initialisation so `terraform test` can run plan-only assertions without
-connecting to TFC.
+**Plan file is a binary:** `day21.tfplan` must never be committed to Git — it contains state references and is only valid for the state version it was generated against. It is listed in `.gitignore`.
+
+---
+
+## Let's Connect
+
+If this walkthrough helped you understand infrastructure deployment workflows, I'd love to hear from you. Follow along as I work through all 30 days of the Terraform Challenge, there's a new post every day covering real infrastructure, real problems, and real fixes.
+
+- **Blog** — deep dives on every day of the challenge: [medium.com/@ntinyaribelinda](https://medium.com/@ntinyaribelinda)
+- **LinkedIn** — connect and follow the journey: [linkedin.com/in/belinda-ntinyari](https://www.linkedin.com/in/belinda-ntinyari/)
+
+> If you're doing the 30-Day Terraform Challenge too, drop a comment on the blog post. I'd love to see what infrastructure changes you deployed through your workflow today.
