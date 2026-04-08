@@ -1,0 +1,50 @@
+# sentinel/require-instance-type.sentinel
+#
+# WHAT THIS ENFORCES:
+#   Every aws_instance and aws_launch_template resource in the plan
+#   must use an instance type from the approved list below.
+#   Any plan that tries to deploy m5.large, c5.xlarge, or any other
+#   non-approved type will be BLOCKED before apply is permitted.
+#
+# WHAT IT BLOCKS (examples):
+#   - instance_type = "m5.large"    → BLOCKED
+#   - instance_type = "c5.xlarge"   → BLOCKED
+#   - instance_type = "t2.micro"    → ALLOWED
+#
+# HOW IT DIFFERS FROM terraform validate:
+#   terraform validate checks syntax and type correctness only —
+#   it cannot enforce business rules like "only use cheap instance types".
+#   Sentinel runs AFTER the plan is generated and can inspect the
+#   actual values that would be applied, enforcing policy across
+#   every workspace in the organisation.
+
+import "tfplan/v2" as tfplan
+
+allowed_instance_types = [
+  "t2.micro",
+  "t2.small",
+  "t2.medium",
+  "t3.micro",
+  "t3.small",
+  "t3.medium",
+]
+
+# Check aws_instance resources
+instances_ok = rule {
+  all tfplan.resource_changes as _, rc {
+    rc.type is not "aws_instance" or
+    rc.change.after.instance_type in allowed_instance_types
+  }
+}
+
+# Check aws_launch_template resources (used by ASGs)
+launch_templates_ok = rule {
+  all tfplan.resource_changes as _, rc {
+    rc.type is not "aws_launch_template" or
+    rc.change.after.instance_type in allowed_instance_types
+  }
+}
+
+main = rule {
+  instances_ok and launch_templates_ok
+}
