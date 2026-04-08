@@ -2,6 +2,8 @@
 # Tests run with: terraform test
 # All tests use command = plan (no AWS credentials needed, no real resources created)
 
+mock_provider "aws" {}
+
 variables {
   cluster_name        = "test-cluster-day21"
   instance_type       = "t2.micro"

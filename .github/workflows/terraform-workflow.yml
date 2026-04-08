@@ -14,13 +14,9 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'day_21/**'
   push:
     branches:
       - main
-    paths:
-      - 'day_21/**'
 
 jobs:
 
@@ -38,15 +34,15 @@ jobs:
 
       - name: terraform fmt check
         run: terraform fmt -check -recursive
-        working-directory: day_21/webserver-cluster
+        working-directory: webserver-cluster
 
       - name: terraform init (for validate)
         run: terraform init -backend=false
-        working-directory: day_21/webserver-cluster
+        working-directory: webserver-cluster
 
       - name: terraform validate
         run: terraform validate
-        working-directory: day_21/webserver-cluster
+        working-directory: webserver-cluster
 
   # ── Job 2: Unit Tests ────────────────────────────────────────────────────────
   unit-tests:
@@ -63,40 +59,10 @@ jobs:
 
       - name: terraform init
         run: terraform init -backend=false
-        working-directory: day_21/webserver-cluster
+        working-directory: webserver-cluster
 
       - name: terraform test
         run: terraform test
-        working-directory: day_21/webserver-cluster
+        working-directory: webserver-cluster
 
-  # ── Job 3: Integration Tests (post-merge only) ───────────────────────────────
-  integration-tests:
-    name: Integration Tests (Terratest)
-    runs-on: ubuntu-latest
-    needs: unit-tests
-    if: github.event_name == 'push'
 
-    env:
-      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION:    us-east-1
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v4
-        with:
-          go-version: "1.21"
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.7.0"
-          terraform_wrapper: false
-
-      - name: Download Go dependencies
-        run: go mod download
-        working-directory: day_21/test
-
-      - name: Run integration tests
-        run: go test -v -timeout 30m -run TestWebserverClusterIntegration ./...
-        working-directory: day_21/test

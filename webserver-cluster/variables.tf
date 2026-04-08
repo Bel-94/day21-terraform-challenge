@@ -7,7 +7,7 @@ variable "aws_region" {
 variable "cluster_name" {
   description = "Base name for all resources"
   type        = string
-  default     = "belinda-day21"
+  default     = "belinda-day21-cw"
 }
 
 variable "instance_type" {
